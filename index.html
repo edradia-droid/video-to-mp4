@@ -53,61 +53,100 @@ video{width:100%;margin-top:1rem;border-radius:.75rem;background:#000;display:no
   <video id="preview" controls playsinline></video>
   <a class="save" id="save" style="display:none">Save MP4</a>
 </div>
-<p style="text-align:center;color:var(--mute);font-size:.7rem;margin-top:1rem">v2</p>
+<p style="text-align:center;color:var(--mute);font-size:.7rem;margin-top:1rem">v3</p>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
 <script>
 const $=id=>document.getElementById(id);
-const CDN='https://cdn.jsdelivr.net/npm/';
+const CDN='https://cdn.jsdelivr.net/npm/',JS='text/javascript';
 let ff=null,file=null,stage='starting',lastLog='';
 const say=(t,err)=>{$('msg').textContent=t;$('msg').className=err?'err':''};
+const prog=p=>{p=Math.min(100,Math.max(0,Math.round(p*100)));$('fill').style.width=p+'%';say('Converting... '+p+'%')};
 const blobURL=async(u,t)=>{const r=await fetch(u);if(!r.ok)throw new Error('Download failed ('+r.status+'): '+u);return URL.createObjectURL(new Blob([await r.arrayBuffer()],{type:t}))};
 $('pickLabel').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('file').click()}});
 $('file').addEventListener('change',e=>{
   file=e.target.files[0]||null;
   $('go').disabled=!file;
   $('save').style.display=$('preview').style.display='none';
-  if(file){$('pickLabel').textContent=file.name;say(`${(file.size/1048576).toFixed(1)} MB ready.`)}
+  if(file){$('pickLabel').textContent=file.name;say((file.size/1048576).toFixed(1)+' MB ready.')}
 });
 async function load(){
   if(ff)return ff;
-  stage='loading the converter';
-  say('Loading the converter (one time, about 30 MB)...');
-  if(!window.FFmpegWASM)throw new Error('The converter script did not download. Check your internet connection or ad blocker.');
-  const f=new FFmpegWASM.FFmpeg();
-  f.on('log',({message})=>{lastLog=message});
-  f.on('progress',({progress})=>{const p=Math.min(100,Math.max(0,Math.round(progress*100)));$('fill').style.width=p+'%';say(`Converting... ${p}%`)});
-  const w=await blobURL(CDN+'@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js','text/javascript');
-  const c=await blobURL(CDN+'@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js','text/javascript');
-  const m=await blobURL(CDN+'@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm','application/wasm');
-  stage='starting the converter';
-  await f.load({classWorkerURL:w,coreURL:c,wasmURL:m});
-  ff=f;
-  return ff;
+  if(!window.FFmpegWASM)throw new Error('The converter script did not download. Check your connection or ad blocker.');
+  const V='@ffmpeg/ffmpeg@0.12.10/dist/umd/',C='@ffmpeg/core@0.12.6/dist/umd/';
+  const tries=[
+    async()=>({classWorkerURL:await blobURL(CDN+V+'814.ffmpeg.js',JS),coreURL:await blobURL(CDN+C+'ffmpeg-core.js',JS),wasmURL:await blobURL(CDN+C+'ffmpeg-core.wasm','application/wasm')}),
+    async()=>({classWorkerURL:await blobURL(CDN+V+'814.ffmpeg.js',JS),coreURL:CDN+C+'ffmpeg-core.js',wasmURL:CDN+C+'ffmpeg-core.wasm'})
+  ];
+  let last;
+  for(const t of tries){
+    const f=new FFmpegWASM.FFmpeg();
+    f.on('log',({message})=>{lastLog=message});
+    f.on('progress',({progress})=>prog(progress));
+    try{
+      stage='loading the converter';say('Loading the converter (one time, about 30 MB)...');
+      const cfg=await t();
+      stage='starting the converter';
+      await f.load(cfg);
+      ff=f;return f;
+    }catch(e){last=e;console.warn(e);try{f.terminate()}catch(_){}}
+  }
+  throw last;
+}
+async function viaFFmpeg(){
+  const f=await load();
+  stage='reading your file';
+  const ext=(file.name.split('.').pop()||'mp4').toLowerCase().replace(/[^a-z0-9]/g,'');
+  await f.writeFile('input.'+ext,new Uint8Array(await file.arrayBuffer()));
+  stage='converting';lastLog='';say('Converting... 0%');
+  const code=await f.exec(['-i','input.'+ext,'-c:v','libx264','-preset','ultrafast','-crf',$('q').value,'-pix_fmt','yuv420p','-vf','scale=trunc(iw/2)*2:trunc(ih/2)*2','-c:a','aac','-b:a','160k','-movflags','+faststart','out.mp4']);
+  if(code!==0)throw new Error('This file could not be converted. '+lastLog);
+  stage='saving the result';
+  const data=await f.readFile('out.mp4');
+  await f.deleteFile('input.'+ext);await f.deleteFile('out.mp4');
+  return {blob:new Blob([data.buffer],{type:'video/mp4'}),ext:'mp4'};
+}
+async function viaRecorder(){
+  stage='using the browser method';
+  if(!window.MediaRecorder)throw new Error('This browser cannot convert video. Try Chrome, Edge or Safari.');
+  const v=document.createElement('video');v.playsInline=true;
+  v.src=URL.createObjectURL(file);
+  await new Promise((ok,no)=>{v.onloadedmetadata=ok;v.onerror=()=>no(new Error('This browser cannot open this video format.'))});
+  const cap=v.captureStream||v.mozCaptureStream;
+  if(!cap)throw new Error('This browser cannot capture video.');
+  const tracks=[...cap.call(v).getVideoTracks()];
+  try{const ac=new (window.AudioContext||window.webkitAudioContext)();const d=ac.createMediaStreamDestination();ac.createMediaElementSource(v).connect(d);tracks.push(...d.stream.getAudioTracks())}catch(_){}
+  const mime=['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4','video/webm;codecs=vp9,opus','video/webm'].find(m=>MediaRecorder.isTypeSupported(m));
+  const rec=new MediaRecorder(new MediaStream(tracks),mime?{mimeType:mime}:undefined);
+  const chunks=[];rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  const done=new Promise(r=>rec.onstop=r);
+  v.ontimeupdate=()=>prog(v.currentTime/(v.duration||1));
+  v.onended=()=>rec.stop();
+  rec.start(1000);await v.play();await done;
+  const type=rec.mimeType||'video/webm';
+  return {blob:new Blob(chunks,{type}),ext:type.includes('mp4')?'mp4':'webm'};
 }
 $('go').addEventListener('click',async()=>{
   if(!file)return;
   $('go').disabled=true;$('bar').style.display='block';$('fill').style.width='0';
   try{
-    const f=await load();
-    stage='reading your file';
-    const ext=(file.name.split('.').pop()||'mp4').toLowerCase().replace(/[^a-z0-9]/g,'');
-    await f.writeFile('input.'+ext,new Uint8Array(await file.arrayBuffer()));
-    stage='converting';lastLog='';
-    say('Converting... 0%');
-    const code=await f.exec(['-i','input.'+ext,'-c:v','libx264','-preset','ultrafast','-crf',$('q').value,
-      '-pix_fmt','yuv420p','-vf','scale=trunc(iw/2)*2:trunc(ih/2)*2','-c:a','aac','-b:a','160k','-movflags','+faststart','out.mp4']);
-    if(code!==0)throw new Error('This file could not be converted. '+lastLog);
-    stage='saving the result';
-    const data=await f.readFile('out.mp4');
-    const url=URL.createObjectURL(new Blob([data.buffer],{type:'video/mp4'}));
-    const name=file.name.replace(/\.[^.]+$/,'')+'.mp4';
+    let out;
+    try{out=await viaFFmpeg()}
+    catch(e){
+      if(!/converter/.test(stage))throw e;
+      console.warn(e);
+      say('Main converter is not available here. Using the built-in method, which runs at video speed. Keep this page open.');
+      out=await viaRecorder();
+    }
+    const url=URL.createObjectURL(out.blob);
     $('preview').src=url;$('preview').style.display='block';
-    $('save').href=url;$('save').download=name;$('save').style.display='block';
-    $('fill').style.width='100%';say('Done. Preview it or save it.');
-    await f.deleteFile('input.'+ext);await f.deleteFile('out.mp4');
+    $('save').href=url;$('save').download=file.name.replace(/\.[^.]+$/,'')+'.'+out.ext;
+    $('save').textContent='Save '+out.ext.toUpperCase();$('save').style.display='block';
+    $('fill').style.width='100%';
+    say(out.ext==='mp4'?'Done. Preview it or save it.':'Done, but this browser can only make WebM, not MP4. Try Chrome, Edge or Safari for a true MP4.');
   }catch(err){
-    console.error(err);say('Failed while '+stage+': '+((err&&err.message)||String(err)||'unknown error')+(lastLog?' ['+lastLog+']':''),true);
+    console.error(err);
+    say('Failed while '+stage+': '+((err&&err.message)||String(err)||'unknown error')+(lastLog?' ['+lastLog+']':''),true);
   }
   $('go').disabled=false;
 });
