@@ -58,9 +58,9 @@ video{width:100%;margin-top:1rem;border-radius:.75rem;background:#000;display:no
 <script>
 const $=id=>document.getElementById(id);
 const CDN='https://cdn.jsdelivr.net/npm/';
-let ff=null,file=null;
+let ff=null,file=null,stage='starting',lastLog='';
 const say=(t,err)=>{$('msg').textContent=t;$('msg').className=err?'err':''};
-const blobURL=async(u,t)=>URL.createObjectURL(new Blob([await (await fetch(u)).arrayBuffer()],{type:t}));
+const blobURL=async(u,t)=>{const r=await fetch(u);if(!r.ok)throw new Error('Download failed ('+r.status+'): '+u);return URL.createObjectURL(new Blob([await r.arrayBuffer()],{type:t}))};
 $('pickLabel').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('file').click()}});
 $('file').addEventListener('change',e=>{
   file=e.target.files[0]||null;
@@ -70,15 +70,18 @@ $('file').addEventListener('change',e=>{
 });
 async function load(){
   if(ff)return ff;
+  stage='loading the converter';
   say('Loading the converter (one time, about 30 MB)...');
-  const {FFmpeg}=FFmpegWASM;
-  ff=new FFmpeg();
-  ff.on('progress',({progress})=>{const p=Math.min(100,Math.max(0,Math.round(progress*100)));$('fill').style.width=p+'%';say(`Converting... ${p}%`)});
-  await ff.load({
-    classWorkerURL:await blobURL(CDN+'@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js','text/javascript'),
-    coreURL:await blobURL(CDN+'@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js','text/javascript'),
-    wasmURL:await blobURL(CDN+'@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm','application/wasm')
-  });
+  if(!window.FFmpegWASM)throw new Error('The converter script did not download. Check your internet connection or ad blocker.');
+  const f=new FFmpegWASM.FFmpeg();
+  f.on('log',({message})=>{lastLog=message});
+  f.on('progress',({progress})=>{const p=Math.min(100,Math.max(0,Math.round(progress*100)));$('fill').style.width=p+'%';say(`Converting... ${p}%`)});
+  const w=await blobURL(CDN+'@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js','text/javascript');
+  const c=await blobURL(CDN+'@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js','text/javascript');
+  const m=await blobURL(CDN+'@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm','application/wasm');
+  stage='starting the converter';
+  await f.load({classWorkerURL:w,coreURL:c,wasmURL:m});
+  ff=f;
   return ff;
 }
 $('go').addEventListener('click',async()=>{
@@ -86,12 +89,15 @@ $('go').addEventListener('click',async()=>{
   $('go').disabled=true;$('bar').style.display='block';$('fill').style.width='0';
   try{
     const f=await load();
+    stage='reading your file';
     const ext=(file.name.split('.').pop()||'mp4').toLowerCase().replace(/[^a-z0-9]/g,'');
     await f.writeFile('input.'+ext,new Uint8Array(await file.arrayBuffer()));
+    stage='converting';lastLog='';
     say('Converting... 0%');
     const code=await f.exec(['-i','input.'+ext,'-c:v','libx264','-preset','ultrafast','-crf',$('q').value,
       '-pix_fmt','yuv420p','-vf','scale=trunc(iw/2)*2:trunc(ih/2)*2','-c:a','aac','-b:a','160k','-movflags','+faststart','out.mp4']);
-    if(code!==0)throw new Error('This file could not be converted.');
+    if(code!==0)throw new Error('This file could not be converted. '+lastLog);
+    stage='saving the result';
     const data=await f.readFile('out.mp4');
     const url=URL.createObjectURL(new Blob([data.buffer],{type:'video/mp4'}));
     const name=file.name.replace(/\.[^.]+$/,'')+'.mp4';
@@ -100,7 +106,7 @@ $('go').addEventListener('click',async()=>{
     $('fill').style.width='100%';say('Done. Preview it or save it.');
     await f.deleteFile('input.'+ext);await f.deleteFile('out.mp4');
   }catch(err){
-    say((err&&err.message)||'Something went wrong. Try a smaller file or reload the page.',true);
+    console.error(err);say('Failed while '+stage+': '+((err&&err.message)||String(err)||'unknown error')+(lastLog?' ['+lastLog+']':''),true);
   }
   $('go').disabled=false;
 });
